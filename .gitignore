@@ -9,3 +9,6 @@ wheels/
 # Virtual environments
 .venv
 *.db
+optimizer_cache.db-shm
+optimizer_cache.db-wal
+optimizer_debug.log

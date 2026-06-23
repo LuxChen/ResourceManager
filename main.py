@@ -1,14 +1,14 @@
 import os
-import sys
 import threading
 import hashlib
 import subprocess
 import sqlite3
 from pathlib import Path
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 import psutil
 from datetime import datetime, timedelta
+
 
 class LocalDatabaseManager:
     """本地 SQLite 缓存与索引双引擎（含智能分析扩展）"""
@@ -18,6 +18,12 @@ class LocalDatabaseManager:
 
     def init_db(self):
         with sqlite3.connect(self.db_path) as conn:
+            # 提升写入性能：启用 WAL 模式和适度同步策略
+            try:
+                conn.execute('PRAGMA journal_mode=WAL')
+                conn.execute('PRAGMA synchronous=NORMAL')
+            except Exception:
+                pass
             # 1. 历史哈希表
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS file_hashes (
@@ -32,7 +38,8 @@ class LocalDatabaseManager:
             # 2. 全局文件索引表
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS global_index (
-                    filepath TEXT PRIMARY KEY,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filepath TEXT unique,
                     filename TEXT,
                     extension TEXT,
                     size INTEGER,
@@ -42,28 +49,112 @@ class LocalDatabaseManager:
             conn.execute('CREATE INDEX IF NOT EXISTS idx_global_filename ON global_index(filename)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_global_ext ON global_index(extension)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_global_size ON global_index(size)')
+            # 尝试创建 FTS5 虚拟表以加速全文检索，如果不可用则回退
+            try:
+                conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS global_index_fts USING fts5(filename, extension, filepath, content='global_index', content_rowid='id')")
+                conn.execute('''CREATE TRIGGER IF NOT EXISTS global_index_ai AFTER INSERT ON global_index BEGIN
+                                   INSERT INTO global_index_fts(rowid, filename, extension, filepath) VALUES (new.id, new.filename, new.extension, new.filepath);
+                                 END''')
+                conn.execute('''CREATE TRIGGER IF NOT EXISTS global_index_ad AFTER DELETE ON global_index BEGIN
+                                   INSERT INTO global_index_fts(global_index_fts, rowid, filename, extension, filepath) VALUES('delete', old.id, old.filename, old.extension, old.filepath);
+                                 END''')
+                conn.execute('''CREATE TRIGGER IF NOT EXISTS global_index_au AFTER UPDATE ON global_index BEGIN
+                                   INSERT INTO global_index_fts(global_index_fts, rowid, filename, extension, filepath) VALUES('delete', old.id, old.filename, old.extension, old.filepath);
+                                   INSERT INTO global_index_fts(rowid, filename, extension, filepath) VALUES (new.id, new.filename, new.extension, new.filepath);
+                                 END''')
+                self.fts_available = True
+            except Exception:
+                self.fts_available = False
 
     def clear_global_index(self):
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM global_index")
+            try:
+                if getattr(self, 'fts_available', False):
+                    conn.execute("DELETE FROM global_index_fts")
+            except Exception:
+                pass
 
     def batch_insert_index(self, data_list):
         if not data_list: return
         with sqlite3.connect(self.db_path) as conn:
             conn.executemany('INSERT OR REPLACE INTO global_index VALUES (?, ?, ?, ?, ?)', data_list)
+            # FTS5 触发器会自动保持全局索引的同步，无需额外写入操作
 
     def search_global_index(self, keyword, ext_filter="所有格式", limit=800):
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.cursor()
-            query = "SELECT filename, extension, size, mtime, filepath FROM global_index WHERE filename LIKE ?"
-            params = [f"%{keyword}%"]
-            if ext_filter and ext_filter != "所有格式":
-                query += " AND extension = ?"
-                params.append(ext_filter.lower())
-            query += " ORDER BY size DESC LIMIT ?"
-            params.append(limit)
-            cursor.execute(query, params)
-            return cursor.fetchall()
+        kw = (keyword or '').strip()
+        if getattr(self, 'fts_available', False) and kw:
+            match = ' OR '.join([f'{part}*' for part in kw.split() if part])
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                query = "SELECT gi.filename, gi.extension, gi.size, gi.mtime, gi.filepath FROM global_index_fts f JOIN global_index gi ON gi.id = f.rowid WHERE "
+                params = []
+                if len(kw) > 2:
+                    query += " f.filename MATCH ?"
+                    params.append(match)
+                else:
+                    query += " gi.filename like ?"
+                    params.append(f"%{kw}%")
+                if ext_filter and ext_filter != "所有格式":
+                    query += " AND gi.extension = ?"
+                    params.append(ext_filter.lower())
+                query += " ORDER BY gi.size DESC LIMIT ?"
+                params.append(limit)
+                cursor.execute(query, params)
+                return cursor.fetchall()
+        else:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                query = "SELECT filename, extension, size, mtime, filepath FROM global_index WHERE filename LIKE ?"
+                params = [f"%{kw}%"]
+                if ext_filter and ext_filter != "所有格式":
+                    query += " AND extension = ?"
+                    params.append(ext_filter.lower())
+                query += " ORDER BY size DESC LIMIT ?"
+                params.append(limit)
+                cursor.execute(query, params)
+                return cursor.fetchall()
+
+    def stream_search_global_index(self, keyword, ext_filter="所有格式", batch=200):
+        """按批返回查询结果，适用于大结果集的流式消费，避免一次性将所有行载入内存。"""
+        kw = (keyword or '').strip()
+        if getattr(self, 'fts_available', False) and kw:
+            match = ' OR '.join([f'{part}*' for part in kw.split() if part])
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                query = "SELECT gi.filename, gi.extension, gi.size, gi.mtime, gi.filepath FROM global_index_fts f JOIN global_index gi ON gi.id = f.rowid WHERE "
+                params = []
+                if len(kw) > 2:
+                    query += " f.filename MATCH ?"
+                    params.append(match)
+                else:
+                    query += " gi.filename like ?"
+                    params.append(f"%{kw}%")
+                if ext_filter and ext_filter != "所有格式":
+                    query += " AND gi.extension = ?"
+                    params.append(ext_filter.lower())
+                query += " ORDER BY gi.size DESC"
+                cursor.execute(query, params)
+                while True:
+                    rows = cursor.fetchmany(batch)
+                    if not rows:
+                        break
+                    yield rows
+        else:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                query = "SELECT filename, extension, size, mtime, filepath FROM global_index WHERE filename LIKE ?"
+                params = [f"%{kw}%"]
+                if ext_filter and ext_filter != "所有格式":
+                    query += " AND extension = ?"
+                    params.append(ext_filter.lower())
+                query += " ORDER BY size DESC"
+                cursor.execute(query, params)
+                while True:
+                    rows = cursor.fetchmany(batch)
+                    if not rows:
+                        break
+                    yield rows
 
     # ==================== ✨ 新增：智能推荐清洗数据源下钻 ====================
     def get_smart_recommendations(self, min_size_mb=50, limit=500):
@@ -133,36 +224,34 @@ class FullyAutomatedOptimizerGUI:
         具备视觉反馈的通用排序器：
         1. 识别数值/文本类型自动排序
         2. 更新表头显示 ▲/▼ 标识
-        3. 重置其他表头状态
+        3. 重置其他列状态并保留排序命令
         """
-        # 1. 恢复其他列的原始标题状态（去除图标）
+        # 1. 恢复其他列的原始标题状态（去除图标）并设置排序命令
         for c in tree['columns']:
-            text = tree.heading(c, 'text')
-            if ' ▲' in text or ' ▼' in text:
-                tree.heading(c, text=text.replace(' ▲', '').replace(' ▼', ''))
+            header = tree.heading(c, 'text').replace(' ▲', '').replace(' ▼', '')
+            tree.heading(c, text=header, command=lambda c=c: self.sort_treeview(tree, c, False))
 
         # 2. 对当前点击列执行排序
         data = [(tree.set(child, col), child) for child in tree.get_children('')]
-        
+
         # 智能类型判断
         try:
-            # 尝试按数值排序（处理 KB/MB/Byte 等后缀）
             data.sort(key=lambda t: float(t[0].split()[0]), reverse=reverse)
         except (ValueError, IndexError):
-            # 文本排序
-            data.sort(reverse=reverse)
+            data.sort(key=lambda t: t[0].lower() if isinstance(t[0], str) else t[0], reverse=reverse)
 
         # 3. 移动节点
-        for index, (val, child) in enumerate(data):
+        for index, (_, child) in enumerate(data):
             tree.move(child, '', index)
 
         # 4. 更新当前列标题为高亮标识
-        new_text = f"{tree.heading(col, 'text')} {'▲' if reverse else '▼'}"
-        tree.heading(col, text=new_text, command=lambda: self.sort_treeview(tree, col, not reverse))
-        self.recommend_tree.heading('score', text='🔥 推荐指数', 
-            command=lambda: self.sort_treeview(self.recommend_tree, 'score', False))
-        self.recommend_tree.heading('size', text='文件体积', 
-            command=lambda: self.sort_treeview(self.recommend_tree, 'size', False))
+        heading_text = tree.heading(col, 'text').replace(' ▲', '').replace(' ▼', '')
+        tree.heading(col, text=f"{heading_text} {'▲' if reverse else '▼'}", command=lambda: self.sort_treeview(tree, col, not reverse))
+
+    def make_treeview_sortable(self, tree):
+        for col in tree['columns']:
+            header = tree.heading(col, 'text')
+            tree.heading(col, text=header, command=lambda c=col: self.sort_treeview(tree, c, False))
     # ==================== UI 绑定逻辑示例（在所有 Setup 方法中使用） ==================== 
     def create_widgets(self):
         self.notebook = ttk.Notebook(self.root)
@@ -259,7 +348,7 @@ class FullyAutomatedOptimizerGUI:
         self.recommend_tree.column('reason', width=240)
         self.recommend_tree.column('path', width=260)
         self.recommend_tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
-        
+        self.make_treeview_sortable(self.recommend_tree)
         self.recommend_tree.bind("<Button-3>", lambda event: self.show_right_click_menu(event, self.recommend_tree))
         scrollbar = ttk.Scrollbar(table_frame, command=self.recommend_tree.yview)
         scrollbar.pack(fill=tk.Y, side=tk.RIGHT)
@@ -339,6 +428,7 @@ class FullyAutomatedOptimizerGUI:
         self.search_path_entry = ttk.Entry(idx_frame, font=("Segoe UI", 10))
         self.search_path_entry.insert(0, os.environ.get('USERPROFILE', 'C:\\'))
         self.search_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(idx_frame, text="📂 浏览", command=self.browse_search_target).pack(side=tk.LEFT, padx=5)
         self.btn_build_idx = ttk.Button(idx_frame, text="🔄 构建/更新全局索引", command=lambda: self.start_thread(self.build_global_index, [self.btn_build_idx, self.btn_search], cancel_button=self.btn_cancel_search))
         self.btn_build_idx.pack(side=tk.LEFT, padx=5)
         
@@ -351,7 +441,7 @@ class FullyAutomatedOptimizerGUI:
         self.search_ext_combo = ttk.Combobox(filter_frame, values=["所有格式", ".exe", ".zip", ".mp4", ".pdf", ".log"], state="readonly", width=10)
         self.search_ext_combo.current(0)
         self.search_ext_combo.pack(side=tk.LEFT, padx=5)
-        self.btn_search = ttk.Button(filter_frame, text="⚡ 闪电搜索", command=self.execute_fast_search)
+        self.btn_search = ttk.Button(filter_frame, text="⚡ 闪电搜索", command=lambda: self.start_thread(self.execute_fast_search, [self.btn_search, self.btn_build_idx], cancel_button=self.btn_cancel_search))
         self.btn_search.pack(side=tk.LEFT, padx=10)
         self.btn_cancel_search = ttk.Button(filter_frame, text="🛑 终止索引", state=tk.DISABLED, command=self.trigger_cancel)
         self.btn_cancel_search.pack(side=tk.LEFT, padx=5)
@@ -367,6 +457,7 @@ class FullyAutomatedOptimizerGUI:
         self.search_tree.heading('name', text='文件名称'); self.search_tree.heading('ext', text='扩展名'); self.search_tree.heading('size', text='大小'); self.search_tree.heading('mtime', text='修改时间'); self.search_tree.heading('path', text='完整路径')
         self.search_tree.column('name', width=200); self.search_tree.column('ext', width=80, anchor=tk.CENTER); self.search_tree.column('size', width=90, anchor=tk.CENTER); self.search_tree.column('mtime', width=130, anchor=tk.CENTER); self.search_tree.column('path', width=400)
         self.search_tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        self.make_treeview_sortable(self.search_tree)
         self.search_tree.bind("<Button-3>", lambda event: self.show_right_click_menu(event, self.search_tree))
         scrollbar = ttk.Scrollbar(table_frame, command=self.search_tree.yview)
         scrollbar.pack(fill=tk.Y, side=tk.RIGHT)
@@ -379,6 +470,10 @@ class FullyAutomatedOptimizerGUI:
         self.unused_combo = ttk.Combobox(config_frame, values=list(self.smart_paths_dict.keys()), state="readonly", width=45)
         if self.smart_paths_dict: self.unused_combo.current(0)
         self.unused_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Label(config_frame, text="手动目录:").pack(side=tk.LEFT, padx=(10,5))
+        self.unused_path_entry = ttk.Entry(config_frame, font=("Segoe UI", 10), width=35)
+        self.unused_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(config_frame, text="📂 浏览", command=self.browse_unused_target).pack(side=tk.LEFT, padx=5)
         ttk.Label(config_frame, text="闲置时间 >").pack(side=tk.LEFT, padx=(10, 2))
         self.days_spin = ttk.Spinbox(config_frame, from_=30, to=1095, width=5)
         self.days_spin.set(180)
@@ -405,6 +500,7 @@ class FullyAutomatedOptimizerGUI:
         self.unused_tree.heading('name', text='名称'); self.unused_tree.heading('type', text='闲置属性'); self.unused_tree.heading('size', text='大小'); self.unused_tree.heading('last_used', text='最后活动时间'); self.unused_tree.heading('path', text='完整路径')
         self.unused_tree.column('name', width=180); self.unused_tree.column('type', width=160, anchor=tk.CENTER); self.unused_tree.column('size', width=80, anchor=tk.CENTER); self.unused_tree.column('last_used', width=120, anchor=tk.CENTER); self.unused_tree.column('path', width=320)
         self.unused_tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        self.make_treeview_sortable(self.unused_tree)
         self.unused_tree.bind("<Button-3>", lambda event: self.show_right_click_menu(event, self.unused_tree))
         scrollbar = ttk.Scrollbar(table_frame, command=self.unused_tree.yview)
         scrollbar.pack(fill=tk.Y, side=tk.RIGHT)
@@ -414,15 +510,40 @@ class FullyAutomatedOptimizerGUI:
         path_frame = ttk.LabelFrame(self.clean_frame, text="智能推荐扫描区域", padding=10)
         path_frame.pack(fill=tk.X, padx=10, pady=5)
         ttk.Label(path_frame, text="推荐目标:").pack(side=tk.LEFT, padx=5)
-        self.clean_combo = ttk.Combobox(path_frame, values=list(self.smart_paths_dict.keys()), state="readonly", width=45)
+        self.clean_combo = ttk.Combobox(path_frame, values=list(self.smart_paths_dict.keys()), state="readonly", width=35)
         if self.smart_paths_dict: self.clean_combo.current(0)
         self.clean_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Label(path_frame, text="手动目录:").pack(side=tk.LEFT, padx=(10, 5))
+        self.clean_path_entry = ttk.Entry(path_frame, font=("Segoe UI", 10), width=35)
+        self.clean_path_entry.insert(0, os.environ.get('USERPROFILE', 'C:\\'))
+        self.clean_path_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(path_frame, text="📂 浏览", command=self.browse_clean_target).pack(side=tk.LEFT, padx=5)
+
+        filter_frame = ttk.LabelFrame(self.clean_frame, text="清理策略过滤", padding=10)
+        filter_frame.pack(fill=tk.X, padx=10, pady=5)
+        ttk.Label(filter_frame, text="垃圾类型:").pack(side=tk.LEFT, padx=5)
+        self.clean_ext_combo = ttk.Combobox(filter_frame, values=["所有垃圾", ".tmp", ".log", ".bak", ".old", ".chk", ".lnk", ".cache", ".dmp", ".db"], state="readonly", width=12)
+        self.clean_ext_combo.current(0)
+        self.clean_ext_combo.pack(side=tk.LEFT, padx=5)
+        ttk.Label(filter_frame, text="过期天数 >").pack(side=tk.LEFT, padx=(10, 2))
+        self.old_days_spin = ttk.Spinbox(filter_frame, from_=7, to=3650, width=6)
+        self.old_days_spin.set(180)
+        self.old_days_spin.pack(side=tk.LEFT)
+        ttk.Label(filter_frame, text="天").pack(side=tk.LEFT, padx=2)
 
         btn_frame = ttk.Frame(self.clean_frame, padding=5)
         btn_frame.pack(fill=tk.X, padx=10)
-        self.btn_clean = ttk.Button(btn_frame, text="🔍 一键清空目标内垃圾", command=lambda: self.start_thread(self.clean_junk, [self.btn_clean, self.btn_dup], cancel_button=self.btn_cancel_clean))
+        self.btn_clean = ttk.Button(btn_frame, text="🔍 一键清空目标内垃圾", command=lambda: self.start_thread(self.clean_junk, [self.btn_clean, self.btn_dup, self.btn_manual_clean, self.btn_type_clean, self.btn_old_clean, self.btn_empty_clean], cancel_button=self.btn_cancel_clean))
         self.btn_clean.pack(side=tk.LEFT, padx=5)
-        self.btn_dup = ttk.Button(btn_frame, text="👯 极速扫描重复文件", command=lambda: self.start_thread(self.clean_duplicates, [self.btn_clean, self.btn_dup], cancel_button=self.btn_cancel_clean))
+        self.btn_manual_clean = ttk.Button(btn_frame, text="📂 手动目录清理", command=lambda: self.start_thread(lambda: self.clean_junk(target=self.clean_path_entry.get().strip()), [self.btn_clean, self.btn_dup, self.btn_manual_clean, self.btn_type_clean, self.btn_old_clean, self.btn_empty_clean], cancel_button=self.btn_cancel_clean))
+        self.btn_manual_clean.pack(side=tk.LEFT, padx=5)
+        self.btn_type_clean = ttk.Button(btn_frame, text="🗂️ 按类型清理", command=lambda: self.start_thread(lambda: self.clean_junk(ext_filter=self.clean_ext_combo.get()), [self.btn_clean, self.btn_dup, self.btn_manual_clean, self.btn_type_clean, self.btn_old_clean, self.btn_empty_clean], cancel_button=self.btn_cancel_clean))
+        self.btn_type_clean.pack(side=tk.LEFT, padx=5)
+        self.btn_old_clean = ttk.Button(btn_frame, text="🕒 清理旧文件", command=lambda: self.start_thread(self.clean_old_files, [self.btn_clean, self.btn_dup, self.btn_manual_clean, self.btn_type_clean, self.btn_old_clean, self.btn_empty_clean], cancel_button=self.btn_cancel_clean))
+        self.btn_old_clean.pack(side=tk.LEFT, padx=5)
+        self.btn_empty_clean = ttk.Button(btn_frame, text="🧹 清空空文件夹", command=lambda: self.start_thread(self.clean_empty_folders, [self.btn_clean, self.btn_dup, self.btn_manual_clean, self.btn_type_clean, self.btn_old_clean, self.btn_empty_clean], cancel_button=self.btn_cancel_clean))
+        self.btn_empty_clean.pack(side=tk.LEFT, padx=5)
+        self.btn_dup = ttk.Button(btn_frame, text="👯 极速扫描重复文件", command=lambda: self.start_thread(self.clean_duplicates, [self.btn_clean, self.btn_dup, self.btn_manual_clean, self.btn_type_clean, self.btn_old_clean, self.btn_empty_clean], cancel_button=self.btn_cancel_clean))
         self.btn_dup.pack(side=tk.LEFT, padx=5)
         self.btn_cancel_clean = ttk.Button(btn_frame, text="🛑 终止当前操作", state=tk.DISABLED, command=self.trigger_cancel)
         self.btn_cancel_clean.pack(side=tk.LEFT, padx=5)
@@ -451,62 +572,126 @@ class FullyAutomatedOptimizerGUI:
             self.proc_tree.heading(col, text=text)
             self.proc_tree.column(col, width=width)
         self.proc_tree.pack(fill=tk.BOTH, expand=True)
+        self.make_treeview_sortable(self.proc_tree)
         self.refresh_processes()
 
     # ==================== 后台引擎逻辑 ====================
     def build_global_index(self):
-        target_dir = self.search_path_entry.get().strip()
-        if not target_dir or not os.path.exists(target_dir): return
-        self.safe_ui_update(lambda: self.lbl_search_status.config(text="正在重新初始化全局索引库..."))
+        target_dir = self.normalize_path(self.search_path_entry.get().strip())
+        if not target_dir or not os.path.exists(target_dir):
+            return
+        self.safe_ui_update(lambda: self.lbl_search_status.config(text="正在初始化全局索引库..."))
         self.db.clear_global_index()
-        batch_pool, batch_size, total_indexed = [], 3000, 0
-        self.safe_ui_update(lambda: [self.search_progress.config(mode='indeterminate'), self.search_progress.start(10)])
-        
-        for r, d, fls in os.walk(target_dir):
-            if self.cancel_event.is_set(): break
-            for f in fls:
-                file_path = Path(r) / f
+        batch_pool, batch_size, total_indexed = [], 2000, 0
+        # 使用流式文件遍历以减少内存与系统调用开销
+        self.safe_ui_update(lambda: [self.search_progress.config(mode='indeterminate', value=0), self.search_progress.start(10)])
+
+        def file_iter(root_path):
+            stack = [root_path]
+            while stack:
+                current = stack.pop()
                 try:
-                    stat_info = file_path.stat()
-                    batch_pool.append((str(file_path), f, file_path.suffix.lower(), stat_info.st_size, stat_info.st_mtime))
-                    if len(batch_pool) >= batch_size:
+                    with os.scandir(current) as it:
+                        for entry in it:
+                            try:
+                                if entry.is_dir(follow_symlinks=False):
+                                    stack.append(entry.path)
+                                elif entry.is_file(follow_symlinks=False):
+                                    try:
+                                        st = entry.stat(follow_symlinks=False)
+                                    except Exception:
+                                        continue
+                                    yield (entry.path, entry.name, Path(entry.path).suffix.lower(), st.st_size, st.st_mtime)
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+
+        try:
+            for file_path, name, suffix, size, mtime in file_iter(target_dir):
+                if self.cancel_event.is_set():
+                    break
+                batch_pool.append((file_path, name, suffix, size, mtime))
+                if len(batch_pool) >= batch_size:
+                    try:
                         self.db.batch_insert_index(batch_pool)
-                        total_indexed += len(batch_pool)
-                        batch_pool.clear()
-                        self.safe_ui_update(lambda c=total_indexed: self.lbl_search_status.config(text=f"建立索引中... 已登记资产: {c}"))
-                except: continue
-        if batch_pool and not self.cancel_event.is_set():
-            self.db.batch_insert_index(batch_pool)
-            total_indexed += len(batch_pool)
-        self.safe_ui_update(lambda: [self.search_progress.stop(), self.search_progress.config(mode='determinate', value=100)])
-        self.safe_ui_update(lambda c=total_indexed: self.lbl_search_status.config(text=f"🎉 索引录入完毕，共记录: {c} 个文件。"))
+                    except Exception:
+                        pass
+                    total_indexed += len(batch_pool)
+                    batch_pool.clear()
+                    self.safe_ui_update(lambda c=total_indexed: self.lbl_search_status.config(text=f"建立索引中... 已登记资产: {c}"))
+        finally:
+            if batch_pool and not self.cancel_event.is_set():
+                try:
+                    self.db.batch_insert_index(batch_pool)
+                except Exception:
+                    pass
+                total_indexed += len(batch_pool)
+
+        if self.cancel_event.is_set():
+            self.safe_ui_update(lambda: [self.search_progress.stop(), self.search_progress.config(mode='determinate', value=0), self.lbl_search_status.config(text=f"⚠️ 索引操作已取消，已记录: {total_indexed} 个文件。")])
+        else:
+            self.safe_ui_update(lambda: [self.search_progress.stop(), self.search_progress.config(mode='determinate', value=100), self.lbl_search_status.config(text=f"🎉 索引录入完毕，共记录: {total_indexed} 个文件。")])
 
     def execute_fast_search(self):
+        # 在后台线程执行并以小批量写回主线程，避免界面卡顿
         keyword = self.search_keyword_entry.get().strip()
         ext_filter = self.search_ext_combo.get()
-        if not keyword and ext_filter == "所有格式": return
+        if not keyword and ext_filter == "所有格式":
+            return
         self.search_tree.delete(*self.search_tree.get_children())
-        results = self.db.search_global_index(keyword, ext_filter)
-        for name, ext, size, mtime, filepath in results:
-            sz_str = f"{size/1048576:.2f} MB" if size>=1048576 else f"{size/1024:.1f} KB"
-            mtime_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
-            self.search_tree.insert('', tk.END, values=(name, ext.upper(), sz_str, mtime_str, filepath))
+        self.safe_ui_update(lambda: [self.search_progress.config(mode='indeterminate', value=0), self.search_progress.start(8), self.lbl_search_status.config(text="正在查询...")])
+        inserted = 0
+        batch_size = 200
+        try:
+            for batch in self.db.stream_search_global_index(keyword, ext_filter, batch=batch_size):
+                if self.cancel_event.is_set():
+                    break
+                rows_to_insert = []
+                for name, ext, size, mtime, filepath in batch:
+                    sz_str = f"{size/1048576:.2f} MB" if size>=1048576 else f"{size/1024:.1f} KB"
+                    mtime_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
+                    rows_to_insert.append((name, ext.upper(), sz_str, mtime_str, filepath))
+                def _insert_rows(rows=rows_to_insert):
+                    for r in rows:
+                        self.search_tree.insert('', tk.END, values=r)
+                self.safe_ui_update(_insert_rows)
+                inserted += len(rows_to_insert)
+                self.safe_ui_update(lambda c=inserted: self.lbl_search_status.config(text=f"已加载结果: {c}"))
+                if self.cancel_event.is_set():
+                    break
+        finally:
+            self.safe_ui_update(lambda: [self.search_progress.stop(), self.search_progress.config(mode='determinate', value=100), self.lbl_search_status.config(text=f"查询结束，已显示 {inserted} 条结果。")])
 
     def scan_unused_files(self):
-        target = self.get_selected_path(self.unused_combo)
-        if not target or not os.path.exists(target): return
-        try: threshold_days = int(self.days_spin.get())
-        except: threshold_days = 180
+        # 优先使用手动输入/选择的路径，否则使用推荐目标
+        manual = getattr(self, 'unused_path_entry', None)
+        if manual and manual.get().strip():
+            target = self.normalize_path(manual.get().strip())
+        else:
+            target = self.normalize_path(self.get_selected_path(self.unused_combo))
+        if not target or not os.path.exists(target):
+            self.safe_ui_update(lambda: self.lbl_unused_status.config(text="错误：请选择有效目标路径。"))
+            return
+        try:
+            threshold_days = int(self.days_spin.get())
+        except ValueError:
+            threshold_days = 180
         self.safe_ui_update(lambda: [self.unused_tree.delete(i) for i in self.unused_tree.get_children()])
         total_files = sum(len(fls) for r, d, fls in os.walk(target))
-        if total_files == 0: return
+        if total_files == 0:
+            self.safe_ui_update(lambda: self.lbl_unused_status.config(text="该目录没有可扫描的文件。"))
+            return
         now, idx, found = datetime.now(), 0, 0
         cutoff = now - timedelta(days=threshold_days)
         for r, d, fls in os.walk(target):
-            if self.cancel_event.is_set(): return
+            if self.cancel_event.is_set():
+                self.safe_ui_update(lambda: self.lbl_unused_status.config(text=f"扫描已取消，已发现 {found} 个闲置文件。"))
+                return
             for f in fls:
                 idx += 1
-                if idx % 50 == 0: self.update_generic_progress(self.unused_progress, self.lbl_unused_status, idx, total_files, "闲置审查")
+                if idx % 50 == 0:
+                    self.update_generic_progress(self.unused_progress, self.lbl_unused_status, idx, total_files, "闲置审查")
                 try:
                     fp = Path(r) / f
                     stat = fp.stat()
@@ -514,38 +699,66 @@ class FullyAutomatedOptimizerGUI:
                     if la < cutoff:
                         found += 1
                         self.safe_ui_update(lambda fp=fp, sz=stat.st_size/1048576, d=(now-la).days, la=la: self.unused_tree.insert('', tk.END, values=(fp.name, f"闲置[{d}天]", f"{sz:.2f} MB", la.strftime('%Y-%m-%d'), str(fp))))
-                except: pass
+                except Exception:
+                    pass
+        self.safe_ui_update(lambda: self.lbl_unused_status.config(text=f"扫描完成：共发现 {found} 个闲置文件。"))
 
-    def clean_junk(self):
-        target = self.get_selected_path(self.clean_combo)
-        if not target or not os.path.exists(target): return
+    def clean_junk(self, target=None, ext_filter=None):
+        if target is None or target == '':
+            target = self.get_selected_path(self.clean_combo)
+        target = self.normalize_path(target)
+        if not target or not os.path.exists(target):
+            self.safe_ui_update(lambda: self.lbl_status.config(text="错误：请选择有效目标路径。"))
+            return
+        if ext_filter is None:
+            ext_filter = getattr(self, 'clean_ext_combo', None)
+            if ext_filter is not None:
+                ext_filter = self.clean_ext_combo.get()
+            else:
+                ext_filter = "所有垃圾"
+        if ext_filter == "所有垃圾":
+            suffixes = [ext.lower() for ext in self.junk_extensions]
+        else:
+            suffixes = [ext_filter.lower()]
         total = sum(len(fls) for r, d, fls in os.walk(target))
         released, idx = 0, 0
         for r, d, fls in os.walk(target):
-            if self.cancel_event.is_set(): return
+            if self.cancel_event.is_set():
+                self.safe_ui_update(lambda: self.lbl_status.config(text=f"清理已取消，已释放 {released/1048576:.2f} MB。"))
+                return
             for f in fls:
                 idx += 1
-                if idx % 50 == 0: self.update_generic_progress(self.progress, self.lbl_status, idx, total, "基础清理")
+                if idx % 50 == 0:
+                    self.update_generic_progress(self.progress, self.lbl_status, idx, total, "基础清理")
                 fp = Path(r) / f
-                if fp.suffix.lower() in self.junk_extensions:
+                if fp.suffix.lower() in suffixes:
                     try:
                         released += fp.stat().st_size
                         fp.unlink()
-                    except: pass
+                        self.append_log(f"已删除垃圾文件: {fp}")
+                    except Exception:
+                        self.append_log(f"删除失败: {fp}")
+        self.safe_ui_update(lambda: self.lbl_status.config(text=f"清理完成：释放空间 {released/1048576:.2f} MB。"))
         self.safe_ui_update(lambda: messagebox.showinfo("完成", f"释放空间: {released/1048576:.2f} MB"))
 
     def clean_duplicates(self):
-        target = self.get_selected_path(self.clean_combo)
-        if not target or not os.path.exists(target): return
+        target = self.normalize_path(self.get_selected_path(self.clean_combo))
+        if not target or not os.path.exists(target):
+            self.safe_ui_update(lambda: self.lbl_status.config(text="错误：请选择有效目标路径。"))
+            return
         size_dict = {}
         for r, d, fls in os.walk(target):
             for f in fls:
                 fp = Path(r) / f
-                try: size_dict.setdefault(fp.stat().st_size, []).append(fp)
-                except: pass
+                try:
+                    size_dict.setdefault(fp.stat().st_size, []).append(fp)
+                except Exception:
+                    pass
         candidates = {sz: paths for sz, paths in size_dict.items() if len(paths) > 1 and sz > 0}
         candidate_count = sum(len(paths) for paths in candidates.values())
-        if candidate_count == 0: return
+        if candidate_count == 0:
+            self.safe_ui_update(lambda: self.lbl_status.config(text="未发现重复文件。"))
+            return
         hashes, duplicates, processed = {}, [], 0
         for size, paths in candidates.items():
             for file_path in paths:
@@ -555,18 +768,89 @@ class FullyAutomatedOptimizerGUI:
                     str_path, mtime = str(file_path), file_path.stat().st_mtime
                     h = self.db.get_hash(str_path, size, mtime)
                     if not h:
-                        with open(file_path, 'rb') as f: h = hashlib.md5(f.read(4096)).hexdigest()
+                        hasher = hashlib.md5()
+                        with open(file_path, 'rb') as f:
+                            for chunk in iter(lambda: f.read(8192), b''):
+                                hasher.update(chunk)
+                        h = hasher.hexdigest()
                         self.db.set_hash(str_path, size, mtime, h)
-                    if h in hashes: duplicates.append((file_path, hashes[h]))
-                    else: hashes[h] = file_path
-                except: pass
-        if duplicates:
-            def _del():
-                for dup, orig in duplicates:
-                    if messagebox.askyesnocancel("强力去重", f"删除克隆体?\n{dup}") is True:
-                        try: dup.unlink()
-                        except: pass
-            self.safe_ui_update(_del)
+                    if h in hashes:
+                        duplicates.append((file_path, hashes[h]))
+                    else:
+                        hashes[h] = file_path
+                except Exception:
+                    pass
+        if not duplicates:
+            self.safe_ui_update(lambda: self.lbl_status.config(text="未发现重复文件。"))
+            return
+        duplicate_count = len(duplicates)
+        def _del():
+            deleted = 0
+            for dup, orig in duplicates:
+                if messagebox.askyesnocancel("强力去重", f"源文件:\n{orig}\n\n重复文件:\n{dup}\n\n删除该重复文件?") is True:
+                    try:
+                        dup.unlink()
+                        deleted += 1
+                    except Exception:
+                        pass
+            messagebox.showinfo("重复去重", f"处理完成：共删除 {deleted} 个重复文件。")
+        self.safe_ui_update(_del)
+
+    def clean_old_files(self, target=None):
+        if target is None or target == '':
+            target = self.get_selected_path(self.clean_combo)
+        target = self.normalize_path(target)
+        if not target or not os.path.exists(target):
+            self.safe_ui_update(lambda: self.lbl_status.config(text="错误：请选择有效目标路径。"))
+            return
+        try:
+            days = int(self.old_days_spin.get())
+        except ValueError:
+            days = 180
+        cutoff = datetime.now() - timedelta(days=days)
+        total = sum(len(fls) for r, d, fls in os.walk(target))
+        removed, idx = 0, 0
+        for r, d, fls in os.walk(target):
+            if self.cancel_event.is_set():
+                self.safe_ui_update(lambda: self.lbl_status.config(text=f"操作已取消，已删除 {removed} 个旧文件。"))
+                return
+            for f in fls:
+                idx += 1
+                if idx % 50 == 0:
+                    self.update_generic_progress(self.progress, self.lbl_status, idx, total, "旧文件清理")
+                try:
+                    fp = Path(r) / f
+                    mtime = datetime.fromtimestamp(fp.stat().st_mtime)
+                    if mtime < cutoff:
+                        fp.unlink()
+                        removed += 1
+                        self.append_log(f"已删除旧文件: {fp}")
+                except Exception:
+                    pass
+        self.safe_ui_update(lambda: self.lbl_status.config(text=f"清理完成：已删除 {removed} 个 {days} 天前文件。"))
+        self.safe_ui_update(lambda: messagebox.showinfo("完成", f"已删除 {removed} 个 {days} 天前文件。"))
+
+    def clean_empty_folders(self, target=None):
+        if target is None or target == '':
+            target = self.get_selected_path(self.clean_combo)
+        target = self.normalize_path(target)
+        if not target or not os.path.exists(target):
+            self.safe_ui_update(lambda: self.lbl_status.config(text="错误：请选择有效目标路径。"))
+            return
+        removed = 0
+        for root, dirs, files in os.walk(target, topdown=False):
+            if self.cancel_event.is_set():
+                self.safe_ui_update(lambda: self.lbl_status.config(text=f"操作已取消，已删除 {removed} 个空文件夹。"))
+                return
+            try:
+                if not os.listdir(root):
+                    os.rmdir(root)
+                    removed += 1
+                    self.append_log(f"已删除空文件夹: {root}")
+            except Exception:
+                pass
+        self.safe_ui_update(lambda: self.lbl_status.config(text=f"清理完成：已删除 {removed} 个空文件夹。"))
+        self.safe_ui_update(lambda: messagebox.showinfo("完成", f"已删除 {removed} 个空文件夹。"))
 
     def refresh_processes(self):
         self.safe_ui_update(lambda: [self.proc_tree.delete(i) for i in self.proc_tree.get_children()])
@@ -586,12 +870,56 @@ class FullyAutomatedOptimizerGUI:
                 self.refresh_processes()
             except Exception as e: messagebox.showerror("错误", str(e))
 
-    def safe_ui_update(self, func, *args, **kwargs): self.root.after(0, lambda: func(*args, **kwargs))
+    def safe_ui_update(self, func, *args, **kwargs):
+        self.root.after(0, lambda: func(*args, **kwargs))
+
+    def append_log(self, message):
+        def _append():
+            self.log_text.config(state=tk.NORMAL)
+            self.log_text.insert(tk.END, message + "\n")
+            self.log_text.see(tk.END)
+            self.log_text.config(state=tk.DISABLED)
+        self.safe_ui_update(_append)
+
     def update_generic_progress(self, p_bar, lbl, current, total, text):
         percent = int((current / total) * 100) if total > 0 else 100
         self.safe_ui_update(lambda: (p_bar.config(value=percent), lbl.config(text=f"{text}: {percent}% ({current}/{total})")))
-    def trigger_cancel(self): self.cancel_event.set()
-    def get_selected_path(self, combo): return self.smart_paths_dict.get(combo.get(), '')
+
+    def trigger_cancel(self):
+        self.cancel_event.set()
+
+    def normalize_path(self, path):
+        if not path:
+            return ''
+        normalized = os.path.normpath(path)
+        # Windows drive-only path like C: should be treated as root C:\\
+        if len(normalized) == 2 and normalized[1] == ':':
+            normalized = normalized + os.sep
+        return normalized
+
+    def browse_clean_target(self):
+        selected = filedialog.askdirectory(initialdir=os.environ.get('USERPROFILE', 'C:\\'))
+        if selected:
+            self.clean_path_entry.delete(0, tk.END)
+            self.clean_path_entry.insert(0, selected)
+
+    def browse_search_target(self):
+        selected = filedialog.askdirectory(initialdir=os.environ.get('USERPROFILE', 'C:\\'))
+        if selected:
+            self.search_path_entry.delete(0, tk.END)
+            self.search_path_entry.insert(0, selected)
+
+    def browse_unused_target(self):
+        selected = filedialog.askdirectory(initialdir=os.environ.get('USERPROFILE', 'C:\\'))
+        if selected:
+            # if user selected a manual path, populate the unused path entry
+            if hasattr(self, 'unused_path_entry'):
+                self.unused_path_entry.delete(0, tk.END)
+                self.unused_path_entry.insert(0, selected)
+
+    def get_selected_path(self, combo):
+        return self.smart_paths_dict.get(combo.get(), '')
+
     def start_thread(self, target_func, buttons_to_disable, cancel_button=None):
         self.cancel_event.clear()
         for btn in buttons_to_disable:

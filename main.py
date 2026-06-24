@@ -3,6 +3,7 @@ import threading
 import hashlib
 import subprocess
 import sqlite3
+import re
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -78,30 +79,35 @@ class LocalDatabaseManager:
     def batch_insert_index(self, data_list):
         if not data_list: return
         with sqlite3.connect(self.db_path) as conn:
-            conn.executemany('INSERT OR REPLACE INTO global_index VALUES (?, ?, ?, ?, ?)', data_list)
+            # 指定列名插入，避免表结构修改或包含自增主键时的列数量不匹配错误
+            conn.executemany('INSERT OR REPLACE INTO global_index (filepath, filename, extension, size, mtime) VALUES (?, ?, ?, ?, ?)', data_list)
             # FTS5 触发器会自动保持全局索引的同步，无需额外写入操作
+
+    def _is_safe_fts_query(self, keyword):
+        # 仅当关键词中不包含点、连字符等 FTS5 特殊语法字符时，才使用 MATCH
+        return bool(re.fullmatch(r'[\w\s]+', keyword))
 
     def search_global_index(self, keyword, ext_filter="所有格式", limit=800):
         kw = (keyword or '').strip()
-        if getattr(self, 'fts_available', False) and kw:
-            match = ' OR '.join([f'{part}*' for part in kw.split() if part])
+        if getattr(self, 'fts_available', False) and kw and self._is_safe_fts_query(kw):
+            parts = [p for p in kw.split() if p]
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 query = "SELECT gi.filename, gi.extension, gi.size, gi.mtime, gi.filepath FROM global_index_fts f JOIN global_index gi ON gi.id = f.rowid WHERE "
                 params = []
-                if len(kw) > 2:
-                    query += " f.filename MATCH ?"
-                    params.append(match)
-                else:
-                    query += " gi.filename like ?"
-                    params.append(f"%{kw}%")
+                match = ' OR '.join([f'{p}*' for p in parts])
+                query += " f.filename MATCH ?"
+                params.append(match)
                 if ext_filter and ext_filter != "所有格式":
                     query += " AND gi.extension = ?"
                     params.append(ext_filter.lower())
                 query += " ORDER BY gi.size DESC LIMIT ?"
                 params.append(limit)
-                cursor.execute(query, params)
-                return cursor.fetchall()
+                try:
+                    cursor.execute(query, params)
+                    return cursor.fetchall()
+                except sqlite3.OperationalError:
+                    pass
         else:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -118,28 +124,28 @@ class LocalDatabaseManager:
     def stream_search_global_index(self, keyword, ext_filter="所有格式", batch=200):
         """按批返回查询结果，适用于大结果集的流式消费，避免一次性将所有行载入内存。"""
         kw = (keyword or '').strip()
-        if getattr(self, 'fts_available', False) and kw:
-            match = ' OR '.join([f'{part}*' for part in kw.split() if part])
+        if getattr(self, 'fts_available', False) and kw and self._is_safe_fts_query(kw):
+            parts = [p for p in kw.split() if p]
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 query = "SELECT gi.filename, gi.extension, gi.size, gi.mtime, gi.filepath FROM global_index_fts f JOIN global_index gi ON gi.id = f.rowid WHERE "
                 params = []
-                if len(kw) > 2:
-                    query += " f.filename MATCH ?"
-                    params.append(match)
-                else:
-                    query += " gi.filename like ?"
-                    params.append(f"%{kw}%")
+                match = ' OR '.join([f'{p}*' for p in parts])
+                query += " f.filename MATCH ?"
+                params.append(match)
                 if ext_filter and ext_filter != "所有格式":
                     query += " AND gi.extension = ?"
                     params.append(ext_filter.lower())
                 query += " ORDER BY gi.size DESC"
-                cursor.execute(query, params)
-                while True:
-                    rows = cursor.fetchmany(batch)
-                    if not rows:
-                        break
-                    yield rows
+                try:
+                    cursor.execute(query, params)
+                    while True:
+                        rows = cursor.fetchmany(batch)
+                        if not rows:
+                            break
+                        yield rows
+                except sqlite3.OperationalError:
+                    pass
         else:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -642,7 +648,7 @@ class FullyAutomatedOptimizerGUI:
         self.search_tree.delete(*self.search_tree.get_children())
         self.safe_ui_update(lambda: [self.search_progress.config(mode='indeterminate', value=0), self.search_progress.start(8), self.lbl_search_status.config(text="正在查询...")])
         inserted = 0
-        batch_size = 200
+        batch_size = 5000
         try:
             for batch in self.db.stream_search_global_index(keyword, ext_filter, batch=batch_size):
                 if self.cancel_event.is_set():

@@ -76,6 +76,31 @@ class LocalDatabaseManager:
             except Exception:
                 pass
 
+    def get_indexed_files(self, target_dir=None):
+        query = "SELECT filepath, size, mtime FROM global_index"
+        params = []
+        if target_dir:
+            target_dir = os.path.normpath(target_dir)
+            if not target_dir.endswith(os.sep):
+                target_dir += os.sep
+            query += " WHERE filepath LIKE ?"
+            params.append(f"{target_dir}%")
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(query, params)
+            return {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+
+    def delete_index_paths(self, paths):
+        if not paths:
+            return 0
+        deleted = 0
+        with sqlite3.connect(self.db_path) as conn:
+            for i in range(0, len(paths), 1000):
+                batch = paths[i:i+1000]
+                placeholders = ','.join('?' for _ in batch)
+                cursor = conn.execute(f"DELETE FROM global_index WHERE filepath IN ({placeholders})", batch)
+                deleted += cursor.rowcount
+        return deleted
+
     def batch_insert_index(self, data_list):
         if not data_list: return
         with sqlite3.connect(self.db_path) as conn:
@@ -587,9 +612,13 @@ class FullyAutomatedOptimizerGUI:
         if not target_dir or not os.path.exists(target_dir):
             return
         self.safe_ui_update(lambda: self.lbl_search_status.config(text="正在初始化全局索引库..."))
-        self.db.clear_global_index()
+
+        # 读取已有索引，后续删除已移除的文件并仅更新变动项
+        existing_files = self.db.get_indexed_files(target_dir)
+        tracked_keys = {os.path.normcase(os.path.normpath(path)): (path, size, mtime) for path, (size, mtime) in existing_files.items()}
+        stale_paths = set(tracked_keys.keys())
         batch_pool, batch_size, total_indexed = [], 2000, 0
-        # 使用流式文件遍历以减少内存与系统调用开销
+        updated, added = 0, 0
         self.safe_ui_update(lambda: [self.search_progress.config(mode='indeterminate', value=0), self.search_progress.start(10)])
 
         def file_iter(root_path):
@@ -607,7 +636,8 @@ class FullyAutomatedOptimizerGUI:
                                         st = entry.stat(follow_symlinks=False)
                                     except Exception:
                                         continue
-                                    yield (entry.path, entry.name, Path(entry.path).suffix.lower(), st.st_size, st.st_mtime)
+                                    path = os.path.normpath(entry.path)
+                                    yield (path, entry.name, Path(path).suffix.lower(), st.st_size, st.st_mtime)
                             except Exception:
                                 continue
                 except Exception:
@@ -617,7 +647,18 @@ class FullyAutomatedOptimizerGUI:
             for file_path, name, suffix, size, mtime in file_iter(target_dir):
                 if self.cancel_event.is_set():
                     break
-                batch_pool.append((file_path, name, suffix, size, mtime))
+                norm_path = os.path.normcase(file_path)
+                existing = tracked_keys.get(norm_path)
+                if existing:
+                    _, old_size, old_mtime = existing
+                    if old_size != size or old_mtime != mtime:
+                        batch_pool.append((file_path, name, suffix, size, mtime))
+                        updated += 1
+                    stale_paths.discard(norm_path)
+                else:
+                    batch_pool.append((file_path, name, suffix, size, mtime))
+                    added += 1
+
                 if len(batch_pool) >= batch_size:
                     try:
                         self.db.batch_insert_index(batch_pool)
@@ -634,10 +675,19 @@ class FullyAutomatedOptimizerGUI:
                     pass
                 total_indexed += len(batch_pool)
 
+        if stale_paths and not self.cancel_event.is_set():
+            delete_list = [tracked_keys[key][0] for key in stale_paths]
+            try:
+                deleted_count = self.db.delete_index_paths(delete_list)
+                total_indexed += deleted_count
+                self.safe_ui_update(lambda c=deleted_count: self.lbl_search_status.config(text=f"已移除 {c} 个已失效索引条目。"))
+            except Exception:
+                pass
+
         if self.cancel_event.is_set():
             self.safe_ui_update(lambda: [self.search_progress.stop(), self.search_progress.config(mode='determinate', value=0), self.lbl_search_status.config(text=f"⚠️ 索引操作已取消，已记录: {total_indexed} 个文件。")])
         else:
-            self.safe_ui_update(lambda: [self.search_progress.stop(), self.search_progress.config(mode='determinate', value=100), self.lbl_search_status.config(text=f"🎉 索引录入完毕，共记录: {total_indexed} 个文件。")])
+            self.safe_ui_update(lambda: [self.search_progress.stop(), self.search_progress.config(mode='determinate', value=100), self.lbl_search_status.config(text=f"🎉 索引更新完毕：新增 {added} 条，更新 {updated} 条，移除 {len(stale_paths)} 条失效索引。")])
 
     def execute_fast_search(self):
         # 在后台线程执行并以小批量写回主线程，避免界面卡顿

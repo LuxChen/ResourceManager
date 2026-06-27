@@ -104,9 +104,8 @@ class LocalDatabaseManager:
     def batch_insert_index(self, data_list):
         if not data_list: return
         with sqlite3.connect(self.db_path) as conn:
-            # 指定列名插入，避免表结构修改或包含自增主键时的列数量不匹配错误
-            conn.executemany('INSERT OR REPLACE INTO global_index (filepath, filename, extension, size, mtime) VALUES (?, ?, ?, ?, ?)', data_list)
-            # FTS5 触发器会自动保持全局索引的同步，无需额外写入操作
+            with conn: # Use transaction
+                conn.executemany('INSERT OR REPLACE INTO global_index (filepath, filename, extension, size, mtime) VALUES (?, ?, ?, ?, ?)', data_list)
 
     def _is_safe_fts_query(self, keyword):
         # 仅当关键词中不包含点、连字符等 FTS5 特殊语法字符时，才使用 MATCH
@@ -149,10 +148,12 @@ class LocalDatabaseManager:
     def stream_search_global_index(self, keyword, ext_filter="所有格式", batch=200):
         """按批返回查询结果，适用于大结果集的流式消费，避免一次性将所有行载入内存。"""
         kw = (keyword or '').strip()
-        if getattr(self, 'fts_available', False) and kw and self._is_safe_fts_query(kw):
-            parts = [p for p in kw.split() if p]
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("PRAGMA query_only = ON") # Optional, for safety
+            cursor = conn.cursor()
+            
+            if getattr(self, 'fts_available', False) and kw and self._is_safe_fts_query(kw):
+                parts = [p for p in kw.split() if p]
                 query = "SELECT gi.filename, gi.extension, gi.size, gi.mtime, gi.filepath FROM global_index_fts f JOIN global_index gi ON gi.id = f.rowid WHERE "
                 params = []
                 match = ' OR '.join([f'{p}*' for p in parts])
@@ -164,16 +165,9 @@ class LocalDatabaseManager:
                 query += " ORDER BY gi.size DESC"
                 try:
                     cursor.execute(query, params)
-                    while True:
-                        rows = cursor.fetchmany(batch)
-                        if not rows:
-                            break
-                        yield rows
                 except sqlite3.OperationalError:
-                    pass
-        else:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
+                    return # Fallback or handle error
+            else:
                 query = "SELECT filename, extension, size, mtime, filepath FROM global_index WHERE filename LIKE ?"
                 params = [f"%{kw}%"]
                 if ext_filter and ext_filter != "所有格式":
@@ -181,11 +175,12 @@ class LocalDatabaseManager:
                     params.append(ext_filter.lower())
                 query += " ORDER BY size DESC"
                 cursor.execute(query, params)
-                while True:
-                    rows = cursor.fetchmany(batch)
-                    if not rows:
-                        break
-                    yield rows
+                
+            while True:
+                rows = cursor.fetchmany(batch)
+                if not rows:
+                    break
+                yield rows
 
     # ==================== ✨ 新增：智能推荐清洗数据源下钻 ====================
     def get_smart_recommendations(self, min_size_mb=50, limit=500):
